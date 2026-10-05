@@ -11,9 +11,41 @@ string jstr (Json.Object? o, string key) {
     }
     var n = o.get_member (k);
     if (n.get_node_type () != Json.NodeType.VALUE) return "";
-    return n.get_string () ?? "";
-}
 
+    var t = n.get_value_type ();
+    if (t == typeof (string)) return n.get_string () ?? "";
+    if (t == typeof (int64))  return n.get_int ().to_string ();
+    if (t == typeof (double)) return n.get_double ().to_string ();
+    if (t == typeof (bool))   return n.get_boolean ().to_string ();
+    return "";
+}
+int64 jint (Json.Object? o, string key) {
+    if (o == null) return 0;
+    string k = key;
+    if (!o.has_member (k)) {
+        k = key.substring (0, 1).up () + key.substring (1);
+        if (!o.has_member (k)) return 0;
+    }
+    var n = o.get_member (k);
+    if (n.get_node_type () != Json.NodeType.VALUE) return 0;
+
+    // number -> int, string -> parse it
+    if (n.get_value_type () == typeof (string))
+        return int64.parse (n.get_string () ?? "0");
+    return n.get_int ();
+}
+string normalize_person_type (string raw) {
+    switch (raw.down ().strip ()) {
+        case "":
+        case "leerling":
+            return "leerling";
+        case "docent":
+        case "medewerker":
+            return "medewerker";   // verify with a real capture
+        default:
+            return raw.down ().strip ();
+    }
+}
 Json.Object? jobj (Json.Object? o, string key) {
     if (o == null) return null;
     string k = key;
@@ -178,6 +210,100 @@ public class Client : Object {
     public async Json.Node get_raw (string school_path) throws Error {
         return yield get_json ("/api/raw?path=" + Uri.escape_string (school_path, null, true));
     }
+    public async Json.Node post_json (string path, Json.Object body) throws Error {
+    string b = base_url;
+    while (b.has_suffix ("/"))
+        b = b.substring (0, b.length - 1);
+
+    var msg = new Soup.Message ("POST", b + path);
+    if (msg == null)
+        throw new IOError.FAILED ("Invalid server URL");
+
+    msg.request_headers.append ("Authorization", "Bearer " + key);
+    msg.request_headers.append ("Content-Type", "application/json");
+
+    var generator = new Json.Generator ();
+    var node = new Json.Node (Json.NodeType.OBJECT);
+    node.set_object (body);
+    generator.set_root (node);
+
+    string json = generator.to_data (null);
+
+    msg.set_request_body_from_bytes (
+        "application/json",
+        new Bytes (json.data)
+    );
+
+    var bytes = yield session.send_and_read_async (
+        msg, Priority.DEFAULT, null
+    );
+
+    if (msg.status_code < 200 || msg.status_code >= 300) {
+        var data = bytes.get_data ();
+        string body_text = "";
+        if (data.length > 0)
+            body_text = (string) data;
+
+        throw new IOError.FAILED (
+            "HTTP %u: %s",
+            msg.status_code,
+            body_text
+        );
+    }
+
+    if (bytes.get_size () == 0)
+        return new Json.Node (Json.NodeType.NULL);
+
+    var p = new Json.Parser ();
+    var data = bytes.get_data ();
+    p.load_from_data ((string) data, data.length);
+    return p.get_root ();
+}
+public async Json.Node search_people (string query) throws Error {
+    return yield get_json (
+        "/api/personen?q=" + Uri.escape_string (query, null, true)
+    );
+}
+public async Json.Node send_message (
+    int recipient_id,
+    string recipient_type,
+    string subject,
+    string content
+) throws Error {
+    var recipient = new Json.Object ();
+    recipient.set_int_member ("id", recipient_id);
+    recipient.set_string_member ("type", "persoon");
+    recipient.set_boolean_member ("aanHuidigeSelectie", false);
+    recipient.set_string_member ("persoonType", recipient_type);
+
+    var recipients = new Json.Array ();
+    recipients.add_object_element (recipient);
+
+    var cc = new Json.Array ();
+    var bcc = new Json.Array ();
+    var attachments = new Json.Array ();
+
+    var body = new Json.Object ();
+    body.set_array_member ("ontvangers", recipients);
+    body.set_array_member ("kopieOntvangers", cc);
+    body.set_array_member ("blindeKopieOntvangers", bcc);
+    body.set_boolean_member ("heeftPrioriteit", false);
+    body.set_string_member (
+        "inhoud",
+        "<p>" + Markup.escape_text (content).replace ("\n", "<br>") + "</p>"
+    );
+    body.set_string_member ("onderwerp", subject);
+    body.set_string_member ("verzendOptie", "standaard");
+    body.set_array_member ("bijlagen", attachments);
+    var logNode = new Json.Node(Json.NodeType.OBJECT);
+    logNode.set_object(body);
+    var generator = new Json.Generator();
+    generator.set_root(logNode);
+    generator.pretty = true;
+    string logString = generator.to_data(null);
+    message("\n%s", logString);
+    return yield post_json ("/api/berichten", body);
+}
 }
 
 // ---------------------------------------------------------------- page base
@@ -202,6 +328,28 @@ public abstract class Page : Box {
     protected abstract void row_info (Json.Object o, out string title, out string sub,
                                       out string trail, out bool bold);
     protected abstract async void load_detail (Json.Object o) throws Error;
+
+    // Pages can return a grouping key (e.g. the date) to get an orange divider
+    // line between groups. Empty string = no dividers.
+    protected virtual string day_key (Json.Object o) { return ""; }
+
+    void update_header (ListBoxRow row, ListBoxRow? before) {
+        row.set_header (null);
+        if (before == null || items == null) return;
+
+        int i = row.get_index ();
+        int j = before.get_index ();
+        uint n = items.get_length ();
+        if (i < 0 || j < 0 || i >= (int) n || j >= (int) n) return;
+
+        string a = day_key (items.get_object_element (i));
+        string b = day_key (items.get_object_element (j));
+        if (a == "" || a == b) return;
+
+        var line = new Box (Orientation.HORIZONTAL, 0);
+        line.add_css_class ("day-divider");
+        row.set_header (line);
+    }
 
     protected Page (Client c, string spin_label, int def, int min, int max) {
         Object (orientation: Orientation.VERTICAL, spacing: 0);
@@ -231,6 +379,7 @@ public abstract class Page : Box {
 
         // list (left)
         list.row_selected.connect (on_select);
+        list.set_header_func ((row, before) => { update_header (row, before); });
         var left = new ScrolledWindow () {
             child = list,
             hscrollbar_policy = PolicyType.NEVER,
@@ -545,6 +694,14 @@ public class AppointmentsPage : Page {
         bold = false;
     }
 
+    protected override string day_key (Json.Object o) {
+        string iso = jstr (o, "start");
+        if (iso == "") return "";
+        DateTime? dt = new DateTime.from_iso8601 (iso, null);
+        if (dt == null) return iso.length >= 10 ? iso.substring (0, 10) : iso;
+        return dt.to_local ().format ("%Y-%m-%d");
+    }
+
     protected override async void load_detail (Json.Object o) throws Error {
         uint64 my = gen;
         Json.Object d = o;
@@ -592,8 +749,297 @@ public class AppointmentsPage : Page {
 }
 
 public class MessagesPage : Page {
-    public MessagesPage (Client c) { base (c, "Count", 40, 5, 200); }
+ public MessagesPage (Client c) {
+    base (c, "Count", 40, 5, 200);
 
+    var compose = new Button.with_label ("Compose message");
+    compose.add_css_class ("suggested-action");
+    
+    // Put the button at the top of the page.
+    var controls = get_first_child () as Box;
+    if (controls != null)
+        controls.append (compose);
+
+    compose.clicked.connect (() => {
+        open_compose ();
+    });
+}
+void open_compose () {
+    var dialog = new Gtk.Window () {
+        title = "New message",
+        modal = true,
+        transient_for = get_root () as Gtk.Window,
+        default_width = 600,
+        default_height = 500,
+        resizable = true
+    };
+
+    var outer = new Box (Orientation.VERTICAL, 12) {
+        margin_top = 18,
+        margin_bottom = 18,
+        margin_start = 18,
+        margin_end = 18
+    };
+
+    // Recipient search
+    var recipient_box = new Box (Orientation.HORIZONTAL, 8);
+
+    var recipient_search = new Entry () {
+        placeholder_text = "Search for a person…",
+        hexpand = true
+    };
+
+    var search_button = new Button.with_label ("Search");
+
+    recipient_box.append (recipient_search);
+    recipient_box.append (search_button);
+
+    var people = new ListBox () {
+        vexpand = true,
+        selection_mode = SelectionMode.SINGLE
+    };
+
+    var people_scroll = new ScrolledWindow () {
+        child = people,
+        min_content_height = 140,
+        vexpand = true
+    };
+
+    var selected_label = new Label ("No recipient selected") {
+        xalign = 0f
+    };
+    selected_label.add_css_class ("dim-label");
+
+    int selected_id = -1;
+    string selected_type = "leerling";
+
+    search_button.clicked.connect (() => {
+        search_people.begin (recipient_search.text, people, selected_label);
+    });
+
+    // clicking a row selects it (the row's own "activate" only fires on Enter/Space)
+    people.row_selected.connect ((row) => {
+        var person = row as PersonRow;
+        if (person == null) {
+            selected_id = -1;
+            return;
+        }
+        selected_id = person.person_id;
+        selected_type = normalize_person_type (person.person_type);   // <- changed
+        selected_label.label =
+            "Recipient: %s (%d)".printf (person.person_name, person.person_id);
+    });
+
+    recipient_search.activate.connect (() => {
+        search_button.clicked ();
+    });
+
+    // Subject
+    var subject = new Entry () {
+        placeholder_text = "Subject"
+    };
+
+    // Body
+    var body = new TextView () {
+        wrap_mode = WrapMode.WORD_CHAR,
+        vexpand = true
+    };
+
+    var body_scroll = new ScrolledWindow () {
+        child = body,
+        vexpand = true
+    };
+
+    // Buttons
+    var buttons = new Box (Orientation.HORIZONTAL, 8) {
+        halign = Align.END
+    };
+
+    var cancel = new Button.with_label ("Cancel");
+    var send = new Button.with_label ("Send");
+    send.add_css_class ("suggested-action");
+
+    buttons.append (cancel);
+    buttons.append (send);
+
+    cancel.clicked.connect (() => {
+        dialog.close ();
+    });
+
+    send.clicked.connect (() => {
+        if (selected_id < 0) {
+            selected_label.label = "Please select a recipient.";
+            return;
+        }
+
+        if (subject.text.strip () == "") {
+            selected_label.label = "Please enter a subject.";
+            return;
+        }
+
+        var buffer = body.buffer;
+        string text = buffer.text.strip ();
+
+        if (text == "") {
+            selected_label.label = "Please enter a message.";
+            return;
+        }
+
+        send_message.begin (
+            dialog,
+            selected_id,
+            selected_type,
+            subject.text,
+            text,
+            send,
+            selected_label
+        );
+    });
+
+    outer.append (recipient_box);
+    outer.append (people_scroll);
+    outer.append (selected_label);
+    outer.append (subject);
+    outer.append (body_scroll);
+    outer.append (buttons);
+
+    dialog.child = outer;
+    dialog.present ();
+}
+class PersonRow : ListBoxRow {
+    public int person_id;
+    public string person_name = "";
+    public string person_type = "leerling";
+}
+
+async void search_people (
+    string query,
+    ListBox people,
+    Label selected_label
+) {
+    Widget? child;
+
+    while ((child = people.get_first_child ()) != null)
+        people.remove (child);
+
+    if (query.strip () == "") {
+        selected_label.label = "Enter a name to search.";
+        return;
+    }
+
+    selected_label.label = "Searching…";
+
+    try {
+        var node = yield client.search_people (query);
+
+        var array = items_of_node (node);
+
+        if (array == null || array.get_length () == 0) {
+            selected_label.label = "No people found.";
+            return;
+        }
+
+        for (uint i = 0; i < array.get_length (); i++) {
+            var person = array.get_object_element (i);
+
+            int id = (int) jint (person, "id");
+            string first = jstr (person, "roepnaam");
+            string middle = jstr (person, "tussenvoegsel");
+            string last = jstr (person, "achternaam");
+
+            string name = first;
+
+            if (middle != "")
+                name += " " + middle;
+
+            if (last != "")
+                name += " " + last;
+
+            if (name == "")
+                name = "(unknown person)";
+
+            string klas = jstr (person, "klas");
+            string type = jstr (person, "type");
+
+            string subtitle = "";
+            if (klas != "")
+                subtitle += klas;
+            if (type != "")
+                subtitle += (subtitle != "" ? " · " : "") + type;
+
+            var row = new PersonRow ();
+
+            var box = new Box (Orientation.VERTICAL, 2) {
+                margin_top = 7,
+                margin_bottom = 7,
+                margin_start = 10,
+                margin_end = 10
+            };
+
+            var name_label = new Label (esc (name)) {
+                xalign = 0f,
+                use_markup = true
+            };
+
+            box.append (name_label);
+
+            if (subtitle != "") {
+                var sub = new Label (esc (subtitle)) {
+                    xalign = 0f,
+                    use_markup = true
+                };
+                sub.add_css_class ("dim-label");
+                box.append (sub);
+            }
+
+            row.person_id = id;
+            row.person_name = name;
+            row.person_type = type == "" ? "leerling" : type;
+
+            row.child = box;
+            people.append (row);
+        }
+
+        selected_label.label =
+            "%u people found — select one.".printf (array.get_length ());
+
+    } catch (Error e) {
+        selected_label.label = "Search failed: " + e.message;
+    }
+}
+async void send_message (
+    Gtk.Window dialog,
+    int recipient_id,
+    string recipient_type,
+    string subject,
+    string content,
+    Button send,
+    Label status
+) {
+    send.sensitive = false;
+    status.label = "Sending…";
+
+    try {
+        yield client.send_message (
+            recipient_id,
+            recipient_type,
+            subject,
+            content
+        );
+
+        status.label = "Message sent.";
+        send.sensitive = true;
+
+        // Refresh the inbox after sending.
+        refresh.begin ();
+
+        dialog.close ();
+
+    } catch (Error e) {
+        send.sensitive = true;
+        status.label = "Sending failed: " + e.message;
+    }
+}
     protected override string list_path () {
         return "/api/berichten?top=%d".printf ((int) spin.value);
     }
@@ -959,6 +1405,14 @@ row:selected .dim-label {
 /* separators and the divider between list and detail */
 separator {
     background-color: #3f2e22;
+}
+
+/* orange line between days in the appointments list */
+.day-divider {
+    background-color: #ff6a00;
+    min-height: 2px;
+    margin-top: 6px;
+    margin-bottom: 6px;
 }
 paned > separator {
     background-color: #3f2e22;

@@ -14,7 +14,7 @@
 set -u
 cd "$(dirname "$0")"
 
-BIN="${MAGISTER_BIN:-$HOME/Documents/publish/Magister2}"
+BIN="${MAGISTER_BIN:-$HOME/Documents/C-sharp/Magister2/bin/Debug/net10.0/Magister2}"
 SCHOOL="${MAGISTER_SCHOOL:-RSG Pantarijn}"
 USER_NAME="${MAGISTER_USER:-}"
 PORT="${MAGISTER_PORT:-5075}"
