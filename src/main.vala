@@ -270,6 +270,7 @@ public async Json.Node send_message (
     string subject,
     string content
 ) throws Error {
+    
     var recipient = new Json.Object ();
     recipient.set_int_member ("id", recipient_id);
     recipient.set_string_member ("type", "persoon");
