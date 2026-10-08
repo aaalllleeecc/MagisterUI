@@ -14,7 +14,21 @@ resources = gnome.compile_resources(
   source_dir: 'Resources',
 )
 
-executable('magister-gtk', 'src/main.vala', resources,
+sources = files(
+  'src/main.vala',
+  'src/helpers.vala',
+  'src/client.vala',
+  'src/page.vala',
+  'src/appointments-page.vala',
+  'src/messages-page.vala',
+  'src/grades-page.vala',
+  'src/study-guides-page.vala',
+  'src/theme.vala',
+  'src/window.vala',
+  'src/assignments-page.vala',
+)
+
+executable('magister-gtk', sources, resources,
   dependencies: deps,
   c_args: ['-w'],
   install: true)
